@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
@@ -32,43 +33,49 @@ class ReliabilityGateway:
         self.cache = cache
 
     def complete(self, prompt: str) -> GatewayResponse:
-        """Return a reliable response or a static fallback.
+        """Return a reliable response or a static fallback."""
+        start = time.monotonic()
 
-        TODO(student): Improve route reasons, cache safety checks, and error handling.
-        TODO(student): Add cost budget check — if cumulative cost exceeds a threshold,
-        skip expensive providers and route to cache or cheaper fallback.
-        """
         if self.cache is not None:
-            cached, score = self.cache.get(prompt)
+            try:
+                cached, score = self.cache.get(prompt)
+            except Exception:
+                cached, score = None, 0.0
             if cached is not None:
-                return GatewayResponse(cached, f"cache_hit:{score:.2f}", None, True, 0.0, 0.0)
+                elapsed_ms = (time.monotonic() - start) * 1000
+                return GatewayResponse(cached, f"cache_hit:{score:.2f}", None, True, elapsed_ms, 0.0)
 
         last_error: str | None = None
-        for provider in self.providers:
+        for idx, provider in enumerate(self.providers):
             breaker = self.breakers[provider.name]
+            route_label = f"primary:{provider.name}" if idx == 0 else f"fallback:{provider.name}"
             try:
                 response: ProviderResponse = breaker.call(provider.complete, prompt)
                 if self.cache is not None:
-                    self.cache.set(prompt, response.text, {"provider": provider.name})
-                route = "primary" if provider == self.providers[0] else "fallback"
+                    try:
+                        self.cache.set(prompt, response.text, {"provider": provider.name})
+                    except Exception:
+                        pass
+                elapsed_ms = (time.monotonic() - start) * 1000
                 return GatewayResponse(
                     text=response.text,
-                    route=route,
+                    route=f"{route_label}",
                     provider=provider.name,
                     cache_hit=False,
-                    latency_ms=response.latency_ms,
+                    latency_ms=elapsed_ms,
                     estimated_cost=response.estimated_cost,
                 )
             except (ProviderError, CircuitOpenError) as exc:
                 last_error = str(exc)
                 continue
 
+        elapsed_ms = (time.monotonic() - start) * 1000
         return GatewayResponse(
             text="The service is temporarily degraded. Please try again soon.",
             route="static_fallback",
             provider=None,
             cache_hit=False,
-            latency_ms=0.0,
+            latency_ms=elapsed_ms,
             estimated_cost=0.0,
             error=last_error,
         )
